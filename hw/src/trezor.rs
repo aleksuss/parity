@@ -258,6 +258,7 @@ impl Manager {
 		}
 	}
 
+
 	pub fn pin_matrix_ack(&self, device_path: &str, pin: &str) -> Result<bool, Error> {
 		let unlocked = {
 			let usb = self.usb.lock();

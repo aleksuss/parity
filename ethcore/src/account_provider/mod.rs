@@ -32,6 +32,10 @@ use ethstore::accounts_dir::MemoryDirectory;
 use ethstore::ethkey::{Address, Message, Public, Secret, Random, Generator};
 use ethjson::misc::AccountMeta;
 use hardware_wallet::{Error as HardwareError, HardwareWalletManager, KeyPath, TransactionInfo};
+
+// FIXME:
+use hardware_wallet::{Wallet, Ledger};
+
 use super::transaction::{Action, Transaction};
 pub use ethstore::ethkey::Signature;
 pub use ethstore::{Derivation, IndexDerivation, KeyFile};
@@ -116,6 +120,8 @@ fn transient_sstore() -> EthMultiStore {
 }
 
 type AccountToken = String;
+// type WalletTrait<'a> = Wallet<'a, Transaction=Transaction, Error=Error>;
+// type HardwareWalletList<'a> = Vec<Option<&'a Wallet<'a, Transaction=Transaction, Error=Error>>>;
 
 /// Account management.
 /// Responsible for unlocking accounts.
@@ -133,7 +139,8 @@ pub struct AccountProvider {
 	/// Accounts unlocked with rolling tokens
 	transient_sstore: EthMultiStore,
 	/// Accounts in hardware wallets.
-	hardware_store: Option<HardwareWalletManager>,
+	hardware_store: Option<Vec<Box<Wallet<'static, Transaction=Transaction, Error=Error>>>>,
+	// hardware_store: Option<HardwareWalletList<'a>>,
 	/// When unlocking account permanently we additionally keep a raw secret in memory
 	/// to increase the performance of transaction signing.
 	unlock_keep_secret: bool,
@@ -168,14 +175,33 @@ impl AccountProvider {
 	/// Creates new account provider.
 	pub fn new(sstore: Box<SecretStore>, settings: AccountProviderSettings) -> Self {
 		let mut hardware_store = None;
+		// if settings.enable_hardware_wallets {
+		//     match HardwareWalletManager::new() {
+		//         Ok(manager) => {
+		//             manager.set_key_path(if settings.hardware_wallet_classic_key { KeyPath::EthereumClassic } else { KeyPath::Ethereum });
+		//             hardware_store = Some(manager)
+		//         },
+		//         Err(e) => debug!("Error initializing hardware wallets: {}", e),
+		//     }
+		// }
+
 		if settings.enable_hardware_wallets {
-			match HardwareWalletManager::new() {
-				Ok(manager) => {
-					manager.set_key_path(if settings.hardware_wallet_classic_key { KeyPath::EthereumClassic } else { KeyPath::Ethereum });
-					hardware_store = Some(manager)
+			let wallets: Vec<Box<Wallet<'static, Transaction=Transaction, Error=Error>>> = Vec::new();
+			let key_path = if settings.hardware_wallet_classic_key {
+				KeyPath::EthereumClassic }
+			else {
+				KeyPath::Ethereum
+			};
+
+			match Ledger::new() {
+				Ok(ledger) => {
+					ledger.set_key_path(key_path);
+						// let t = Box::new(ledger as Wallet<'static, Transaction=Transaction, Error=Error>);
+						// wallets.push(Box::new(ledger as Wallet));
 				},
 				Err(e) => debug!("Error initializing hardware wallets: {}", e),
 			}
+			hardware_store = Some(wallets);
 		}
 
 		if let Ok(accounts) = sstore.accounts() {
@@ -292,26 +318,39 @@ impl AccountProvider {
 
 	/// Returns addresses of hardware accounts.
 	pub fn hardware_accounts(&self) -> Result<Vec<Address>, Error> {
-		let accounts = self.hardware_store.as_ref().map_or(Vec::new(), |h| h.list_wallets());
-		Ok(accounts.into_iter().map(|a| a.address).collect())
+		// if let Some(ref list) = self.hardware_store {
+		//     for wallet in list.iter() {
+		//         println!("devices: {:?}", wallet.list_devices());
+		//     }
+		// }
+		unimplemented!();
+		// let accounts = self.hardware_store.as_ref()[0].map_or(Vec::new(), |h| h.list_wallets());
+		// Ok(accounts.into_iter().map(|a| a.address).collect())
 	}
 
 	/// Get a list of paths to locked hardware wallets
 	pub fn locked_hardware_accounts(&self) -> Result<Vec<String>, SignError> {
-		match self.hardware_store.as_ref().map(|h| h.list_locked_wallets()) {
-			None => Err(SignError::NotFound),
-			Some(Err(e)) => Err(SignError::Hardware(e)),
-			Some(Ok(s)) => Ok(s),
-		}
+		// if let Some(ref list) = self.hardware_store {
+		//     for wallet in list.iter() {
+		//         println!("devices: {:?}", wallet.list_devices());
+		//     }
+		// }
+		unimplemented!();
+		// match self.hardware_store.as_ref().map(|h| h.list_locked_wallets()) {
+		//     None => Err(SignError::NotFound),
+		//     Some(Err(e)) => Err(SignError::Hardware(e)),
+		//     Some(Ok(s)) => Ok(s),
+		// }
 	}
 
 	/// Provide a pin to a locked hardware wallet on USB path to unlock it
 	pub fn hardware_pin_matrix_ack(&self, path: &str, pin: &str) -> Result<bool, SignError> {
-		match self.hardware_store.as_ref().map(|h| h.pin_matrix_ack(path, pin)) {
-			None => Err(SignError::NotFound),
-			Some(Err(e)) => Err(SignError::Hardware(e)),
-			Some(Ok(s)) => Ok(s),
-		}
+		unimplemented!();
+		// match self.hardware_store.as_ref().map(|h| h.pin_matrix_ack(path, pin)) {
+		//     None => Err(SignError::NotFound),
+		//     Some(Err(e)) => Err(SignError::Hardware(e)),
+		//     Some(Ok(s)) => Ok(s),
+		// }
 	}
 
 	/// Sets addresses of accounts exposed for unknown dapps.
@@ -524,25 +563,27 @@ impl AccountProvider {
 
 	/// Returns each hardware account along with name and meta.
 	pub fn is_hardware_address(&self, address: &Address) -> bool {
-		self.hardware_store.as_ref().and_then(|s| s.wallet_info(address)).is_some()
+		// self.hardware_store.as_ref().and_then(|s| s.wallet_info(address)).is_some()
+		unimplemented!();
 	}
 
 	/// Returns each account along with name and meta.
 	pub fn account_meta(&self, address: Address) -> Result<AccountMeta, Error> {
-		if let Some(info) = self.hardware_store.as_ref().and_then(|s| s.wallet_info(&address)) {
-			Ok(AccountMeta {
-				name: info.name,
-				meta: info.manufacturer,
-				uuid: None,
-			})
-		} else {
-			let account = self.sstore.account_ref(&address)?;
-			Ok(AccountMeta {
-				name: self.sstore.name(&account)?,
-				meta: self.sstore.meta(&account)?,
-				uuid: self.sstore.uuid(&account).ok().map(Into::into),	// allowed to not have a Uuid
-			})
-		}
+		unimplemented!();
+		// if let Some(info) = self.hardware_store.as_ref().and_then(|s| s.wallet_info(&address)) {
+		//     Ok(AccountMeta {
+		//         name: info.name,
+		//         meta: info.manufacturer,
+		//         uuid: None,
+		//     })
+		// } else {
+		//     let account = self.sstore.account_ref(&address)?;
+		//     Ok(AccountMeta {
+		//         name: self.sstore.name(&account)?,
+		//         meta: self.sstore.meta(&account)?,
+		//         uuid: self.sstore.uuid(&account).ok().map(Into::into),	// allowed to not have a Uuid
+		//     })
+		// }
 	}
 
 	/// Returns account public key.
@@ -814,23 +855,24 @@ impl AccountProvider {
 
 	/// Sign transaction with hardware wallet.
 	pub fn sign_with_hardware(&self, address: Address, transaction: &Transaction, chain_id: Option<u64>, rlp_encoded_transaction: &[u8]) -> Result<Signature, SignError> {
-		let t_info = TransactionInfo {
-			nonce: transaction.nonce,
-			gas_price: transaction.gas_price,
-			gas_limit: transaction.gas,
-			to: match transaction.action {
-				Action::Create => None,
-				Action::Call(ref to) => Some(to.clone()),
-			},
-			value: transaction.value,
-			data: transaction.data.to_vec(),
-			chain_id: chain_id,
-		};
-		match self.hardware_store.as_ref().map(|s| s.sign_transaction(&address, &t_info, rlp_encoded_transaction)) {
-			None | Some(Err(HardwareError::KeyNotFound)) => Err(SignError::NotFound),
-			Some(Err(e)) => Err(From::from(e)),
-			Some(Ok(s)) => Ok(s),
-		}
+		unimplemented!();
+		// let t_info = TransactionInfo {
+		//     nonce: transaction.nonce,
+		//     gas_price: transaction.gas_price,
+		//     gas_limit: transaction.gas,
+		//     to: match transaction.action {
+		//         Action::Create => None,
+		//         Action::Call(ref to) => Some(to.clone()),
+		//     },
+		//     value: transaction.value,
+		//     data: transaction.data.to_vec(),
+		//     chain_id: chain_id,
+		// };
+		// match self.hardware_store.as_ref().map(|s| s.sign_transaction(&address, &t_info, rlp_encoded_transaction)) {
+		//     None | Some(Err(HardwareError::KeyNotFound)) => Err(SignError::NotFound),
+		//     Some(Err(e)) => Err(From::from(e)),
+		//     Some(Ok(s)) => Ok(s),
+		// }
 	}
 }
 

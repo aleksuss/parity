@@ -22,6 +22,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
+use std::thread;
 
 use ethereum_types::{H256, Address};
 use ethkey::Signature;
@@ -29,7 +30,7 @@ use hidapi;
 use libusb;
 use parking_lot::{Mutex, RwLock};
 
-use super::{WalletInfo, KeyPath, Device, Wallet};
+use super::{WalletInfo, KeyPath, Device, Wallet, USB_DEVICE_CLASS_DEVICE};
 
 /// Ledger vendor ID
 pub const LEDGER_VID: u16 = 0x2c97;
@@ -96,21 +97,51 @@ impl From<libusb::Error> for Error {
 	}
 }
 
-/// Ledger device manager.
-pub struct Manager {
+/// oooo
+pub struct Ledger {
 	usb: Arc<Mutex<hidapi::HidApi>>,
 	devices: RwLock<Vec<Device>>,
 	key_path: RwLock<KeyPath>,
 }
 
-impl Manager {
+// pub struct Manager {
+//     usb: Arc<Mutex<hidapi::HidApi>>,
+//     devices: RwLock<Vec<Device>>,
+//     key_path: RwLock<KeyPath>,r
+// }
+
+impl Ledger {
 	/// Create a new instance.
-	pub fn new(hidapi: Arc<Mutex<hidapi::HidApi>>) -> Manager {
-		Manager {
+	pub fn new() -> Result<Arc<Ledger>, Error> {
+		let usb_context = Arc::new(libusb::Context::new()?);
+		let hidapi = Arc::new(Mutex::new(hidapi::HidApi::new().map_err(|e| Error::Placeholder)?));
+
+		let ledger = Arc::new(Ledger {
 			usb: hidapi,
 			devices: RwLock::new(Vec::new()),
 			key_path: RwLock::new(KeyPath::Ethereum),
-		}
+		});
+		let l = ledger.clone();
+
+		usb_context.register_callback(
+			Some(LEDGER_VID), None, Some(USB_DEVICE_CLASS_DEVICE),
+			Box::new(EventHandler::new(Arc::downgrade(&ledger))))?;
+
+		// Ledger event thread
+		thread::Builder::new()
+			.name("hw_wallet_ledger".to_string())
+			.spawn(move || {
+				if let Err(e) = l.update_devices() {
+					debug!(target: "hw", "Ledger couldn't connect at startup, error: {}", e);
+				}
+				loop {
+					usb_context.handle_events(Some(Duration::from_millis(500)))
+							   .unwrap_or_else(|e| debug!(target: "hw", "Ledger event handler error: {}", e));
+				}
+			})
+			.ok();
+
+		Ok(ledger)
 	}
 
 	fn send_apdu(handle: &hidapi::HidDevice, command: u8, p1: u8, p2: u8, data: &[u8]) -> Result<Vec<u8>, Error> {
@@ -212,10 +243,11 @@ impl Manager {
 			Err(Error::InvalidDevice)
 		}
 	}
+
 }
 
 // Try to connect to the device using polling in at most the time specified by the `timeout`
-fn try_connect_polling(ledger: Arc<Manager>, timeout: Duration) -> bool {
+fn try_connect_polling(ledger: Arc<Ledger>, timeout: Duration) -> bool {
 	let start_time = Instant::now();
 	while start_time.elapsed() <= timeout {
 		if let Ok(_) = ledger.update_devices() {
@@ -225,7 +257,7 @@ fn try_connect_polling(ledger: Arc<Manager>, timeout: Duration) -> bool {
 	false
 }
 
-impl <'a>Wallet<'a> for Manager {
+impl <'a>Wallet<'a> for Ledger {
 	type Error = Error;
 	type Transaction = &'a [u8];
 
@@ -366,14 +398,12 @@ impl <'a>Wallet<'a> for Manager {
 		Ok(Some(address))
 	}
 
-	fn open_path<R, F>(&self, f: F) -> Result<R, Self::Error>
+	fn open_path<R, F>(&self, f: F) -> Result<R, Error>
 		where F: Fn() -> Result<R, &'static str>
 	{
 		f().map_err(Into::into)
 	}
 }
-
-
 
 /// Ledger event handler
 /// A seperate thread is hanedling incoming events
@@ -381,12 +411,12 @@ impl <'a>Wallet<'a> for Manager {
 /// Note, that this run to completion and race-conditions can't occur but this can
 /// therefore starve other events for being process with a spinlock or similar
 pub struct EventHandler {
-	ledger: Weak<Manager>,
+	ledger: Weak<Ledger>,
 }
 
 impl EventHandler {
 	/// Ledger event handler constructor
-	pub fn new(ledger: Weak<Manager>) -> Self {
+	pub fn new(ledger: Weak<Ledger>) -> Self {
 		Self { ledger: ledger }
 	}
 }
@@ -394,7 +424,7 @@ impl EventHandler {
 impl libusb::Hotplug for EventHandler {
 	fn device_arrived(&mut self, device: libusb::Device) {
 		debug!(target: "hw", "Ledger arrived");
-		if let (Some(ledger), Ok(_)) = (self.ledger.upgrade(), Manager::is_valid_ledger(&device)) {
+		if let (Some(ledger), Ok(_)) = (self.ledger.upgrade(), Ledger::is_valid_ledger(&device)) {
 			if try_connect_polling(ledger, Duration::from_millis(500)) != true {
 				debug!(target: "hw", "Ledger connect timeout");
 			}
@@ -403,7 +433,7 @@ impl libusb::Hotplug for EventHandler {
 
 	fn device_left(&mut self, device: libusb::Device) {
 		debug!(target: "hw", "Ledger left");
-		if let (Some(ledger), Ok(_)) = (self.ledger.upgrade(), Manager::is_valid_ledger(&device)) {
+		if let (Some(ledger), Ok(_)) = (self.ledger.upgrade(), Ledger::is_valid_ledger(&device)) {
 			if try_connect_polling(ledger, Duration::from_millis(500)) != true {
 				debug!(target: "hw", "Ledger disconnect timeout");
 			}

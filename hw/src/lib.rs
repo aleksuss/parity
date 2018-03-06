@@ -32,8 +32,9 @@ extern crate trezor_sys;
 mod ledger;
 mod trezor;
 
-use ethkey::{Address, Signature};
+pub use ledger::Ledger;
 
+use ethkey::{Address, Signature};
 use parking_lot::Mutex;
 use std::fmt;
 use std::sync::Arc;
@@ -56,36 +57,40 @@ pub struct Device {
 // Also, because it doesn't care about the event handler threads
 // It doesn't make sense to keep it only adds complexity in terms of
 // more code
-pub trait Wallet<'a> {
+pub trait Wallet<'a> : Send + Sync {
 	/// Error
 	type Error;
-	/// Transaction format
+
+	/// Transaction
 	type Transaction;
 
 	/// Sign transaction data with wallet managing `address`.
-	fn sign_transaction(&self, address: &Address, transaction: Self::Transaction) -> Result<Signature, Self::Error>;
+	fn sign_transaction(&self, address: &Address, transaction: Self::Transaction) -> Result<Signature, Self::Error>
+		where Self: Sized;
 
 	/// Set key derivation path for a chain.
-	fn set_key_path(&self, key_path: KeyPath);
+	fn set_key_path(&self, key_path: KeyPath) where Self: Sized;
 
 	/// Re-populate device list
 	/// Note, this assumes all devices are iterated over and updated
-	fn update_devices(&self) -> Result<usize, Self::Error>;
+	fn update_devices(&self) -> Result<usize, Self::Error> where Self: Sized;
+
 
 	/// Read device info
-	fn read_device(&self, usb: &hidapi::HidApi, dev_info: &hidapi::HidDeviceInfo) -> Result<Device, Self::Error>;
+	fn read_device(&self, usb: &hidapi::HidApi, dev_info: &hidapi::HidDeviceInfo) -> Result<Device, Self::Error> where Self: Sized;
+
 
 	/// List connected and acknowledged wallets
-	fn list_devices(&self) -> Vec<WalletInfo>;
+	fn list_devices(&self) -> Vec<WalletInfo> where Self: Sized;
 
 	/// List locked wallets
-	fn list_locked_devices(&self) -> Vec<String>;
+	fn list_locked_devices(&self) -> Vec<String> where Self: Sized;
 
 	/// Get wallet info.
-	fn get_wallet(&self, address: &Address) -> Option<WalletInfo>;
+	fn get_wallet(&self, address: &Address) -> Option<WalletInfo> where Self: Sized;
 
 	/// Generate ethereum address for a Wallet
-	fn get_address(&self, device: &hidapi::HidDevice) -> Result<Option<Address>, Self::Error>;
+	fn get_address(&self, device: &hidapi::HidDevice) -> Result<Option<Address>, Self::Error> where Self: Sized;
 
 	/// Open a device using path
 	/// Note, f - is a closure that borrows HidResult<HidDevice>
@@ -94,9 +99,8 @@ pub trait Wallet<'a> {
 	///		* <https://github.com/paritytech/hidapi-rs>
 	///		* <https://github.com/rust-lang/libc>
 	fn open_path<R, F>(&self, f: F) -> Result<R, Self::Error>
-		where F: Fn() -> Result<R, &'static str>;
+		where F: Fn() -> Result<R, &'static str>, Self: Sized;
 }
-
 
 /// Hardware wallet error.
 #[derive(Debug)]
@@ -191,137 +195,139 @@ impl From<libusb::Error> for Error {
 	}
 }
 
-/// Hardware wallet management interface.
-pub struct HardwareWalletManager {
-	exiting: Arc<AtomicBool>,
-	ledger: Arc<ledger::Manager>,
-	trezor: Arc<trezor::Manager>,
-}
+pub struct HardwareWalletManager;
 
-impl HardwareWalletManager {
-	/// Hardware wallet constructor
-	pub fn new() -> Result<HardwareWalletManager, Error> {
-		let usb_context_trezor = Arc::new(libusb::Context::new()?);
-		let usb_context_ledger = Arc::new(libusb::Context::new()?);
-		let hidapi = Arc::new(Mutex::new(hidapi::HidApi::new().map_err(|e| Error::Hid(e.to_string().clone()))?));
-		let ledger = Arc::new(ledger::Manager::new(hidapi.clone()));
-		let trezor = Arc::new(trezor::Manager::new(hidapi.clone()));
-
-		// Subscribe to TREZOR V1
-		// Note, this support only TREZOR V1 becasue TREZOR V2 has another vendorID for some reason
-		// Also, we now only support one product as the second argument specifies
-		usb_context_trezor.register_callback(
-			Some(trezor::TREZOR_VID), Some(trezor::TREZOR_PIDS[0]), Some(USB_DEVICE_CLASS_DEVICE),
-			Box::new(trezor::EventHandler::new(Arc::downgrade(&trezor))))?;
-
-		// Subscribe to all Ledger Devices
-		// This means that we need to check that the given productID is supported
-		// None => LIBUSB_HOTPLUG_MATCH_ANY, in other words that all are subscribed to
-		// More info can be found: http://libusb.sourceforge.net/api-1.0/group__hotplug.html#gae6c5f1add6cc754005549c7259dc35ea
-		usb_context_ledger.register_callback(
-			Some(ledger::LEDGER_VID), None, Some(USB_DEVICE_CLASS_DEVICE),
-			Box::new(ledger::EventHandler::new(Arc::downgrade(&ledger))))?;
-
-		let exiting = Arc::new(AtomicBool::new(false));
-		let thread_exiting_ledger = exiting.clone();
-		let thread_exiting_trezor = exiting.clone();
-		let l = ledger.clone();
-		let t = trezor.clone();
-
-		// Ledger event thread
-		thread::Builder::new()
-			.name("hw_wallet_ledger".to_string())
-			.spawn(move || {
-				if let Err(e) = l.update_devices() {
-					debug!(target: "hw", "Ledger couldn't connect at startup, error: {}", e);
-				}
-				loop {
-					usb_context_ledger.handle_events(Some(Duration::from_millis(500)))
-					           .unwrap_or_else(|e| debug!(target: "hw", "Ledger event handler error: {}", e));
-					if thread_exiting_ledger.load(atomic::Ordering::Acquire) {
-						break;
-					}
-				}
-			})
-			.ok();
-
-		// Trezor event thread
-		thread::Builder::new()
-			.name("hw_wallet_trezor".to_string())
-			.spawn(move || {
-				if let Err(e) = t.update_devices() {
-					debug!(target: "hw", "Trezor couldn't connect at startup, error: {}", e);
-				}
-				loop {
-					usb_context_trezor.handle_events(Some(Duration::from_millis(500)))
-					           .unwrap_or_else(|e| debug!(target: "hw", "Trezor event handler error: {}", e));
-					if thread_exiting_trezor.load(atomic::Ordering::Acquire) {
-						break;
-					}
-				}
-			})
-			.ok();
-
-		Ok(HardwareWalletManager {
-			exiting: exiting,
-			ledger: ledger,
-			trezor: trezor,
-		})
-	}
-
-	/// Select key derivation path for a chain.
-	pub fn set_key_path(&self, key_path: KeyPath) {
-		self.ledger.set_key_path(key_path);
-		self.trezor.set_key_path(key_path);
-	}
-
-	/// List connected wallets. This only returns wallets that are ready to be used.
-	pub fn list_wallets(&self) -> Vec<WalletInfo> {
-		let mut wallets = Vec::new();
-		wallets.extend(self.ledger.list_devices());
-		wallets.extend(self.trezor.list_devices());
-		wallets
-	}
-
-	/// Return a list of paths to locked hardware wallets
-	/// TODO: Why does Trezor only provide locked devices and not Ledger?
-	pub fn list_locked_wallets(&self) -> Result<Vec<String>, Error> {
-		Ok(self.trezor.list_locked_devices())
-	}
-
-	/// Get connected wallet info.
-	pub fn wallet_info(&self, address: &Address) -> Option<WalletInfo> {
-		if let Some(info) = self.ledger.get_wallet(address) {
-			Some(info)
-		} else {
-			self.trezor.get_wallet(address)
-		}
-	}
-
-	/// Sign transaction data with wallet managing `address`.
-	pub fn sign_transaction(&self, address: &Address, t_info: &TransactionInfo, encoded_transaction: &[u8]) -> Result<Signature, Error> {
-		if self.ledger.get_wallet(address).is_some() {
-			Ok(self.ledger.sign_transaction(address, encoded_transaction)?)
-		} else if self.trezor.get_wallet(address).is_some() {
-			Ok(self.trezor.sign_transaction(address, t_info)?)
-		} else {
-			Err(Error::KeyNotFound)
-		}
-	}
-
-	/// Send a pin to a device at a certain path to unlock it
-	/// TODO: Assuming this is Trezor specific but check it!
-	pub fn pin_matrix_ack(&self, path: &str, pin: &str) -> Result<bool, Error> {
-		self.trezor.pin_matrix_ack(path, pin).map_err(Error::TrezorDevice)
-	}
-}
-
-impl Drop for HardwareWalletManager {
-	fn drop(&mut self) {
-		// Indicate to the USB Hotplug handlers that they
-		// shall terminate but don't wait for them to terminate.
-		// If they don't terminate for some reason USB Hotplug events will be handled
-		// even if the HardwareWalletManger has been dropped
-		self.exiting.store(true, atomic::Ordering::Release);
-	}
-}
+// /// Hardware wallet management interface.
+// pub struct HardwareWalletManager {
+//     exiting: Arc<AtomicBool>,
+//     ledger: Arc<ledger::Manager>,
+//     trezor: Arc<trezor::Manager>,
+// }
+//
+// impl HardwareWalletManager {
+//     /// Hardware wallet constructor
+//     pub fn new() -> Result<HardwareWalletManager, Error> {
+//         let usb_context_trezor = Arc::new(libusb::Context::new()?);
+//         let usb_context_ledger = Arc::new(libusb::Context::new()?);
+//         let hidapi = Arc::new(Mutex::new(hidapi::HidApi::new().map_err(|e| Error::Hid(e.to_string().clone()))?));
+//         let ledger = Arc::new(ledger::Manager::new(hidapi.clone()));
+//         let trezor = Arc::new(trezor::Manager::new(hidapi.clone()));
+//
+//         // Subscribe to TREZOR V1
+//         // Note, this support only TREZOR V1 becasue TREZOR V2 has another vendorID for some reason
+//         // Also, we now only support one product as the second argument specifies
+//         usb_context_trezor.register_callback(
+//             Some(trezor::TREZOR_VID), Some(trezor::TREZOR_PIDS[0]), Some(USB_DEVICE_CLASS_DEVICE),
+//             Box::new(trezor::EventHandler::new(Arc::downgrade(&trezor))))?;
+//
+//         // Subscribe to all Ledger Devices
+//         // This means that we need to check that the given productID is supported
+//         // None => LIBUSB_HOTPLUG_MATCH_ANY, in other words that all are subscribed to
+//         // More info can be found: http://libusb.sourceforge.net/api-1.0/group__hotplug.html#gae6c5f1add6cc754005549c7259dc35ea
+//         usb_context_ledger.register_callback(
+//             Some(ledger::LEDGER_VID), None, Some(USB_DEVICE_CLASS_DEVICE),
+//             Box::new(ledger::EventHandler::new(Arc::downgrade(&ledger))))?;
+//
+//         let exiting = Arc::new(AtomicBool::new(false));
+//         let thread_exiting_ledger = exiting.clone();
+//         let thread_exiting_trezor = exiting.clone();
+//         let l = ledger.clone();
+//         let t = trezor.clone();
+//
+//         // Ledger event thread
+//         thread::Builder::new()
+//             .name("hw_wallet_ledger".to_string())
+//             .spawn(move || {
+//                 if let Err(e) = l.update_devices() {
+//                     debug!(target: "hw", "Ledger couldn't connect at startup, error: {}", e);
+//                 }
+//                 loop {
+//                     usb_context_ledger.handle_events(Some(Duration::from_millis(500)))
+//                                .unwrap_or_else(|e| debug!(target: "hw", "Ledger event handler error: {}", e));
+//                     if thread_exiting_ledger.load(atomic::Ordering::Acquire) {
+//                         break;
+//                     }
+//                 }
+//             })
+//             .ok();
+//
+//         // Trezor event thread
+//         thread::Builder::new()
+//             .name("hw_wallet_trezor".to_string())
+//             .spawn(move || {
+//                 if let Err(e) = t.update_devices() {
+//                     debug!(target: "hw", "Trezor couldn't connect at startup, error: {}", e);
+//                 }
+//                 loop {
+//                     usb_context_trezor.handle_events(Some(Duration::from_millis(500)))
+//                                .unwrap_or_else(|e| debug!(target: "hw", "Trezor event handler error: {}", e));
+//                     if thread_exiting_trezor.load(atomic::Ordering::Acquire) {
+//                         break;
+//                     }
+//                 }
+//             })
+//             .ok();
+//
+//         Ok(HardwareWalletManager {
+//             exiting: exiting,
+//             ledger: ledger,
+//             trezor: trezor,
+//         })
+//     }
+//
+//     /// Select key derivation path for a chain.
+//     pub fn set_key_path(&self, key_path: KeyPath) {
+//         self.ledger.set_key_path(key_path);
+//         self.trezor.set_key_path(key_path);
+//     }
+//
+//     /// List connected wallets. This only returns wallets that are ready to be used.
+//     pub fn list_wallets(&self) -> Vec<WalletInfo> {
+//         let mut wallets = Vec::new();
+//         wallets.extend(self.ledger.list_devices());
+//         wallets.extend(self.trezor.list_devices());
+//         wallets
+//     }
+//
+//     /// Return a list of paths to locked hardware wallets
+//     /// TODO: Why does Trezor only provide locked devices and not Ledger?
+//     pub fn list_locked_wallets(&self) -> Result<Vec<String>, Error> {
+//         Ok(self.trezor.list_locked_devices())
+//     }
+//
+//     /// Get connected wallet info.
+//     pub fn wallet_info(&self, address: &Address) -> Option<WalletInfo> {
+//         if let Some(info) = self.ledger.get_wallet(address) {
+//             Some(info)
+//         } else {
+//             self.trezor.get_wallet(address)
+//         }
+//     }
+//
+//     /// Sign transaction data with wallet managing `address`.
+//     pub fn sign_transaction(&self, address: &Address, t_info: &TransactionInfo, encoded_transaction: &[u8]) -> Result<Signature, Error> {
+//         if self.ledger.get_wallet(address).is_some() {
+//             Ok(self.ledger.sign_transaction(address, encoded_transaction)?)
+//         } else if self.trezor.get_wallet(address).is_some() {
+//             Ok(self.trezor.sign_transaction(address, t_info)?)
+//         } else {
+//             Err(Error::KeyNotFound)
+//         }
+//     }
+//
+//     /// Send a pin to a device at a certain path to unlock it
+//     /// TODO: Assuming this is Trezor specific but check it!
+//     pub fn pin_matrix_ack(&self, path: &str, pin: &str) -> Result<bool, Error> {
+//         self.trezor.pin_matrix_ack(path, pin).map_err(Error::TrezorDevice)
+//     }
+// }
+//
+// impl Drop for HardwareWalletManager {
+//     fn drop(&mut self) {
+//         // Indicate to the USB Hotplug handlers that they
+//         // shall terminate but don't wait for them to terminate.
+//         // If they don't terminate for some reason USB Hotplug events will be handled
+//         // even if the HardwareWalletManger has been dropped
+//         self.exiting.store(true, atomic::Ordering::Release);
+//     }
+// }
